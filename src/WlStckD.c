@@ -26,21 +26,163 @@
 #define CONN_HASH_SIZE 1024
 #define SYN_RATE_THRESH 100 // For handking syn flood attacks 
 #define PORT_SCAN_THRESHOLD 10 // Avoid port scan attacts
-
 struct FW_Stat stats;
 static struct nf_hook_ops nf_hk;
 static struct timer_list cleanup_timer;
-
 static struct hlist_head conn_table[CONN_HASH_SIZE];
 static struct hlist_head ip_tracker_table[CONN_HASH_SIZE];
 static spinlock_t conn_lock;
 static spinlock_t tracker_lock;
 
-/* Freeing RCU conns*/
+
+// Free rcu conn
 static void conn_rcu_free(struct rcu_head *rcu) {
   struct Conn_entry *entry = container_of(rcu, struct Conn_entry, rcu);
   kfree(entry);
 }
+
+struct connection_entry * handle_conn(struct iphdr *iph, struct tcphdr *tcph, u8 protocol) {
+  struct connection_entry *entry;
+  struct hlist_head *head;
+  __be16 src_port = 0, dst_port = 0;
+  if (protocol == IPPROTO_TCP && tcph) {
+    src_port = tcph->source;
+    dst_port = tcph->dest;
+  } else if (protocol == IPPROTO_UDP) {
+    struct udphdr *udph = (struct udphdr *)((void *)iph + (iph->ihl * 4)); // Move to ip body(ihl is no of 4 bytes header size)
+    src_port = udph->source;
+    dst_port = udph->dest;
+  }
+  head = &conn_table[hash_conn(iph->saddr, iph->daddr, src_port, dst_port,protocol)];
+  spin_lock_bh(&conn_lock);
+  hlist_for_each_entry(entry, head, node) {
+    if (entry->src_ip == iph->saddr && entry->dst_ip == iph->daddr && entry->src_port == src_port && entry->dst_port == dst_port && entry->protocol == protocol) {
+      entry->last_seen = jiffies;
+      entry->packet_count++;
+      spin_unlock_bh(&conn_lock);
+      return entry;
+    }
+  }
+  entry = kmalloc(sizeof(struct connection_entry), GFP_ATOMIC);
+  if (!entry) {
+    spin_unlock_bh(&conn_lock);
+    return NULL;
+  }
+
+  entry->src_ip = iph->saddr;
+  entry->dst_ip = iph->daddr;
+  entry->src_port = src_port;
+  entry->dst_port = dst_port;
+  entry->protocol = protocol;
+  entry->state = CONN_NEW;
+  entry->last_seen = jiffies;
+  entry->packet_count = 1;
+  entry->syn_count = 0;
+  hlist_add_head_rcu(&entry->node, head);
+  spin_unlock_bh(&conn_lock);
+  return entry;
+}
+
+// Check for SYN flood atack
+bool under_syn_flood(__be32 src_ip) {
+  struct ip_tracker *tracker;
+  struct hlist_head *head;
+  u32 hash = hash_ip(src_ip);
+  unsigned long now = jiffies;
+  bool is_attack = false;
+  spin_lock_bh(&tracker_lock);
+  head = &ip_tracker_table[hash];
+  hlist_for_each_entry(tracker, head, node) {
+    if (tracker->ip == src_ip) {
+      // Reset timer if one second happend
+      if (time_after(now, tracker->last_update + HZ)) {
+        tracker->syn_count = 0;
+        tracker->last_update = now;
+      }
+      tracker->syn_count++;
+      if (tracker->syn_count > SYN_RATE_THRESH) is_attack = true;
+      spin_unlock_bh(&tracker_lock);
+      return is_attack;
+    }
+  }
+
+  tracker = kmalloc(sizeof(struct ip_tracker), GFP_ATOMIC);
+  if (tracker) {
+    tracker->ip = src_ip;
+    tracker->syn_count = 1;
+    tracker->port_count = 0;
+    tracker->last_update = now;
+    memset(tracker->ports_seen, 0, sizeof(tracker->ports_seen));
+    hlist_add_head(&tracker->node, head);
+  }
+  spin_unlock_bh(&tracker_lock);
+  return false;
+}
+
+// Check for port scan attack
+bool under_port_scan(__be32 src_ip, __be16 dst_port) {
+  struct ip_tracker *tracker;
+  struct hlist_head *head;
+  u32 hash = hash_ip(src_ip);
+  unsigned long now = jiffies;
+  bool is_scan = false;
+  int i;
+  spin_lock_bh(&tracker_lock);
+  head = &ip_tracker_table[hash];
+  hlist_for_each_entry(tracker, head, node) {
+    if (tracker->ip == src_ip) {
+      // Reset counter if 1 sec passed
+      if (time_after(now, tracker->last_update + HZ)) {
+        tracker->port_count = 0;
+        tracker->last_update = now;
+        memset(tracker->ports_seen, 0, sizeof(tracker->ports_seen));
+      }
+
+      /* Check if this port was already seen */
+      for (i = 0; i < PORT_SCAN_THRESHOLD; i++) {
+        if (tracker->ports_seen[i] == dst_port) {
+          break;
+        }
+        if (tracker->ports_seen[i] == 0) {
+          tracker->ports_seen[i] = dst_port;
+          tracker->port_count++;
+            break;
+        }
+      }
+      if (tracker->port_count > PORT_SCAN_THRESHOLD) is_scan = true;
+      spin_unlock_bh(&tracker_lock);
+      return is_scan;
+    }
+  }
+  tracker = kmalloc(sizeof(struct ip_tracker), GFP_ATOMIC);
+  if (tracker) {
+    tracker->ip = src_ip;
+    tracker->syn_count = 0;
+    tracker->port_count = 1;
+    tracker->last_update = now;
+    memset(tracker->ports_seen, 0, sizeof(tracker->ports_seen));
+    tracker->ports_seen[0] = dst_port;
+    hlist_add_head(&tracker->node, head);
+  }
+  spin_unlock_bh(&tracker_lock);
+  return false;
+}
+
+// Validate the TCP conn if valid or not 
+bool is_valid_transition(u8 old_state, u8 new_state, struct tcphdr *tcph) {
+  // Handle the three way handshake
+  if (tcph->syn) {
+    if (tcph->ack) {
+      return (old_state == CONN_NEW);
+    } else {
+      return (old_state == CONN_NEW || old_state == CONN_INVALID);
+    }
+  }
+  if (tcph->fin || tcph->rst)  return true;
+  if (tcph->ack) return (old_state == CONN_NEW || old_state == CONN_ESTABLISHED);
+  return true;
+}
+
 
 
 // Expose stats api via the proc entry 
@@ -186,8 +328,6 @@ static inline u32 hash_conn(__be32 src_ip, __be32 dst_ip, __be16 src_port, __be1
 static inline u32 hash_ip(__be32 ip){
     return jhash_1word(ip, 0) & (CONN_HASH_SIZE - 1);
 }
-
-
 
 
 
